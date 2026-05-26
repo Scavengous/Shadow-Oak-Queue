@@ -1,0 +1,657 @@
+#include "driver/rmt.h"
+
+#define LED_PIN      13
+#define BTN_START    25
+#define BTN_P1       33
+#define BTN_P2       32
+#define BTN_MANAGER  12
+#define BTN_ACTION   27
+#define BUZZER_PIN   26
+#define NUM_LEDS     19
+#define RMT_CHANNEL  RMT_CHANNEL_0
+
+struct Color { uint8_t r, g, b; };
+Color ledBuffer[NUM_LEDS];
+
+rmt_item32_t rmt_items[NUM_LEDS * 24];
+
+void rmt_init() {
+  rmt_config_t config;
+  config.rmt_mode                  = RMT_MODE_TX;
+  config.channel                   = RMT_CHANNEL;
+  config.gpio_num                  = (gpio_num_t)LED_PIN;
+  config.mem_block_num             = 1;
+  config.tx_config.loop_en         = false;
+  config.tx_config.carrier_en      = false;
+  config.tx_config.idle_output_en  = true;
+  config.tx_config.idle_level      = RMT_IDLE_LEVEL_LOW;
+  config.clk_div                   = 4;
+  rmt_config(&config);
+  rmt_driver_install(config.channel, 0, 0);
+}
+
+void encode_pixel(int index, uint8_t r, uint8_t g, uint8_t b) {
+  uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+  for (int bit = 23; bit >= 0; bit--) {
+    int i = index * 24 + (23 - bit);
+    if ((grb >> bit) & 1) {
+      rmt_items[i].level0    = 1;
+      rmt_items[i].duration0 = 14;
+      rmt_items[i].level1    = 0;
+      rmt_items[i].duration1 = 12;
+    } else {
+      rmt_items[i].level0    = 1;
+      rmt_items[i].duration0 = 7;
+      rmt_items[i].level1    = 0;
+      rmt_items[i].duration1 = 16;
+    }
+  }
+}
+
+void showLEDs() {
+  for (int i = 0; i < NUM_LEDS; i++)
+    encode_pixel(i, ledBuffer[i].r, ledBuffer[i].g, ledBuffer[i].b);
+  rmt_write_items(RMT_CHANNEL, rmt_items, NUM_LEDS * 24, true);
+  rmt_wait_tx_done(RMT_CHANNEL, portMAX_DELAY);
+  delayMicroseconds(300);
+}
+
+void clearAll() {
+  for (int i = 0; i < NUM_LEDS; i++) ledBuffer[i] = {0, 0, 0};
+  showLEDs();
+}
+
+// =====================
+// BUZZER
+// =====================
+void playTone(int freq, int duration) {
+  int period = 1000000 / freq;
+  long endTime = millis() + duration;
+  while (millis() < endTime) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(period / 2);
+    digitalWrite(BUZZER_PIN, LOW);
+    delayMicroseconds(period / 2);
+  }
+}
+
+void buzzStart()  { playTone(1046,100); delay(50); playTone(1318,100); delay(50); playTone(1568,200); }
+void buzzWin()    { playTone(1568,150); delay(50); playTone(1318,150); delay(50); playTone(1046,300); }
+void buzzTie()    { playTone(800,100); delay(50); playTone(800,100); }
+void buzzTimerEnd(){ for(int i=0;i<3;i++){ playTone(880,200); delay(100); } }
+void buzzClick()  { playTone(800,40); }
+void buzzAdd()    { playTone(600,80); }
+void buzzRemove() { playTone(300,80); }
+
+// =====================
+// COLORS
+// =====================
+#define NUM_COLORS 6
+Color palette[NUM_COLORS] = {
+  {0,   0,   255},  // 0 Blue
+  {255, 0,   0  },  // 1 Red
+  {0,   255, 0  },  // 2 Green
+  {255, 128, 0  },  // 3 Orange
+  {128, 0,   255},  // 4 Purple
+  {0,   255, 255},  // 5 Cyan
+};
+
+bool colorUsed[NUM_COLORS] = {false,false,false,false,false,false};
+
+// =====================
+// QUEUE
+// =====================
+#define MAX_TEAMS 6
+int ledForSlot[MAX_TEAMS] = {0, 1, 14, 15, 16, 17};
+
+int teamColor[NUM_LEDS];
+int queue[MAX_TEAMS];
+int queueSize = 0;
+
+// Tie tracking per slot
+// tieUsed[s] = true means the team currently in slot s
+// has already used their free tie this stint
+bool tieUsed[MAX_TEAMS] = {false,false,false,false,false,false};
+
+int firstAvailableColor() {
+  for (int i = 0; i < NUM_COLORS; i++) if (!colorUsed[i]) return i;
+  return -1;
+}
+
+void addTeamAt(int ledPos, int colorIdx) {
+  teamColor[ledPos]   = colorIdx;
+  colorUsed[colorIdx] = true;
+  for (int s = 0; s < MAX_TEAMS; s++) {
+    if (ledForSlot[s] == ledPos) {
+      if (queueSize < MAX_TEAMS) {
+        for (int i = queueSize; i > s; i--) queue[i] = queue[i-1];
+        queue[s] = ledPos;
+        queueSize++;
+      }
+      break;
+    }
+  }
+}
+
+void removeTeamAt(int ledPos) {
+  if (teamColor[ledPos] < 0) return;
+  colorUsed[teamColor[ledPos]] = false;
+  teamColor[ledPos] = -1;
+
+  int removedSlot = -1;
+  for (int s = 0; s < MAX_TEAMS; s++) {
+    if (ledForSlot[s] == ledPos) { removedSlot = s; break; }
+  }
+  if (removedSlot < 0) return;
+
+  for (int i = 0; i < queueSize; i++) {
+    if (queue[i] == ledPos) {
+      for (int j = i; j < queueSize - 1; j++) queue[j] = queue[j+1];
+      queueSize--;
+      break;
+    }
+  }
+
+  for (int s = removedSlot; s < queueSize; s++) {
+    int thisLed = ledForSlot[s];
+    int nextLed = ledForSlot[s + 1];
+    teamColor[thisLed] = teamColor[nextLed];
+    teamColor[nextLed] = -1;
+    tieUsed[s] = tieUsed[s + 1];
+  }
+  tieUsed[queueSize] = false;
+
+  queueSize = 0;
+  for (int s = 0; s < MAX_TEAMS; s++) {
+    if (teamColor[ledForSlot[s]] >= 0) {
+      queue[queueSize] = ledForSlot[s];
+      queueSize++;
+    }
+  }
+}
+
+// =====================
+// GAME QUEUE OPERATIONS
+// =====================
+
+// Shift colors: slot[dest] gets color from slot[src]
+void shiftColor(int destSlot, int srcSlot) {
+  teamColor[ledForSlot[destSlot]] = teamColor[ledForSlot[srcSlot]];
+  tieUsed[destSlot] = tieUsed[srcSlot];
+}
+
+void clearSlot(int slot) {
+  teamColor[ledForSlot[slot]] = -1;
+  tieUsed[slot] = false;
+}
+
+// P1 wins — P2 goes to back, queue shifts up
+void p1Wins() {
+  int loserColor   = teamColor[ledForSlot[1]];
+  bool loserTie    = tieUsed[1];
+  for (int s = 1; s < queueSize - 1; s++) shiftColor(s, s + 1);
+  teamColor[ledForSlot[queueSize-1]] = loserColor;
+  tieUsed[queueSize-1]               = false; // reset tie when going to queue
+  tieUsed[0]                         = tieUsed[0]; // P1 keeps their tie state
+  Serial.println("P1 wins");
+}
+
+// P2 wins — P1 goes to back, P2 becomes P1, queue shifts up
+void p2Wins() {
+  int loserColor = teamColor[ledForSlot[0]];
+  for (int s = 0; s < queueSize - 1; s++) shiftColor(s, s + 1);
+  teamColor[ledForSlot[queueSize-1]] = loserColor;
+  tieUsed[queueSize-1]               = false; // reset tie when going to queue
+  Serial.println("P2 wins");
+}
+
+// Tie — 3 team special rules, 4+ both leave
+void doTie() {
+  if (queueSize == 3) {
+    // 3 team tie rules
+    bool p1used = tieUsed[0];
+    bool p2used = tieUsed[1];
+
+    if (!p1used && !p2used) {
+      // Neither has used their free tie — P1 gets priority, stays
+      // P2 leaves, P3 becomes new P2
+      tieUsed[0] = true; // P1 used their free tie
+      int loserColor = teamColor[ledForSlot[1]];
+      shiftColor(1, 2);                          // P3 → slot 1 (P2)
+      teamColor[ledForSlot[2]] = loserColor;      // old P2 → slot 2 (queue)
+      tieUsed[2] = false;                         // old P2 resets tie in queue
+      tieUsed[1] = tieUsed[1];                   // P3 keeps its tie state
+      Serial.println("Tie: P1 stays (free tie), P2 replaced by P3");
+
+    } else if (p1used && !p2used) {
+      // P1 already used free tie — P1 must leave, P2 stays
+      tieUsed[1] = true; // P2 uses their free tie
+      int loserColor = teamColor[ledForSlot[0]];
+      shiftColor(0, 1);                          // P2 → slot 0 (P1)
+      shiftColor(1, 2);                          // P3 → slot 1 (P2)
+      teamColor[ledForSlot[2]] = loserColor;      // old P1 → queue
+      tieUsed[2] = false;                         // old P1 resets tie
+      tieUsed[0] = tieUsed[0];                   // P2 (now P1) keeps tie state
+      Serial.println("Tie: P1 must leave (2nd tie), P2 stays");
+
+    } else if (!p1used && p2used) {
+      // P2 already used free tie — P2 must leave, P1 stays
+      tieUsed[0] = true; // P1 uses their free tie
+      int loserColor = teamColor[ledForSlot[1]];
+      shiftColor(1, 2);                          // P3 → slot 1
+      teamColor[ledForSlot[2]] = loserColor;      // old P2 → queue
+      tieUsed[2] = false;                         // old P2 resets tie
+      Serial.println("Tie: P2 must leave (2nd tie), P1 stays");
+
+    } else {
+      // Both used free tie — P1 priority, P1 stays, P2 leaves
+      tieUsed[0] = true;
+      int loserColor = teamColor[ledForSlot[1]];
+      shiftColor(1, 2);
+      teamColor[ledForSlot[2]] = loserColor;
+      tieUsed[2] = false;
+      Serial.println("Tie: both used tie, P1 priority stays, P2 leaves");
+    }
+
+  } else {
+    // 4+ teams — both leave as normal
+    int c0 = teamColor[ledForSlot[0]];
+    int c1 = teamColor[ledForSlot[1]];
+    for (int s = 0; s < queueSize - 2; s++) shiftColor(s, s + 2);
+    teamColor[ledForSlot[queueSize-2]] = c0;
+    teamColor[ledForSlot[queueSize-1]] = c1;
+    tieUsed[queueSize-2] = false;
+    tieUsed[queueSize-1] = false;
+    Serial.println("Tie: both teams leave");
+  }
+}
+
+// =====================
+// TIMER STATE
+// =====================
+int  timerSeconds  = 300;
+bool timerRunning  = false;
+bool gameActive    = false;
+unsigned long lastTick      = 0;
+
+// =====================
+// MANAGER STATE
+// =====================
+bool managerMode      = false;
+bool cursorVisible    = true;
+unsigned long lastCursorBlink = 0;
+unsigned long lastRainbow     = 0;
+int  rainbowHue       = 0;
+
+int allPositions[MAX_TEAMS] = {0, 1, 14, 15, 16, 17};
+int cursorIndex = 0;
+
+int reachableCount() {
+  int count = 3;                        // 0, 1, 14 always
+  if (teamColor[14] >= 0) count++;      // 15 reachable if 14 occupied
+  if (teamColor[15] >= 0) count++;      // 16 reachable if 15 occupied
+  if (teamColor[16] >= 0) count++;      // 17 reachable if 16 occupied
+  return count;
+}
+
+int cursorLed() {
+  int reach = reachableCount();
+  if (cursorIndex >= reach) cursorIndex = reach - 1;
+  return allPositions[cursorIndex];
+}
+
+Color hueToColor(uint8_t hue) {
+  uint8_t r, g, b;
+  if      (hue < 43)  { r=255; g=hue*6; b=0; }
+  else if (hue < 85)  { r=255-(hue-43)*6; g=255; b=0; }
+  else if (hue < 128) { r=0; g=255; b=(hue-85)*6; }
+  else if (hue < 171) { r=0; g=255-(hue-128)*6; b=255; }
+  else if (hue < 213) { r=(hue-171)*6; g=0; b=255; }
+  else                { r=255; g=0; b=255-(hue-213)*6; }
+  return {r, g, b};
+}
+
+// =====================
+// TIMER LED COLOR
+// =====================
+Color getTimerLedColor(int led) {
+  int blockStart = (9 - led) * 30;
+  int blockEnd   = blockStart + 30;
+  if (timerSeconds <= blockStart) return {255, 0, 0};
+  if (timerSeconds >= blockEnd)   return {0, 255, 0};
+  int secondsLeft = timerSeconds - blockStart;
+  if (secondsLeft <= 15) return {255, 255, 0};
+  return {0, 255, 0};
+}
+
+// =====================
+// START WAVE + BLINK
+// =====================
+void startWave() {
+  // 10 LEDs, 0.3s total = 30ms per LED
+  for (int led = 12; led >= 3; led--) {
+    ledBuffer[led] = {0, 255, 0};
+    showLEDs();
+    delay(30);
+  }
+  // Brief blink — 2 flashes only
+  for (int b = 0; b < 2; b++) {
+    for (int i = 3; i <= 12; i++) ledBuffer[i] = {0, 0, 0};
+    showLEDs();
+    delay(150);
+    for (int i = 3; i <= 12; i++) ledBuffer[i] = {0, 255, 0};
+    showLEDs();
+    delay(150);
+  }
+}
+
+void finalWhiteBlink() {
+  for (int b = 0; b < 5; b++) {
+    for (int i = 3; i <= 12; i++) ledBuffer[i] = {255, 255, 255};
+    showLEDs();
+    delay(250);
+    for (int i = 3; i <= 12; i++) ledBuffer[i] = {0, 0, 0};
+    showLEDs();
+    delay(250);
+  }
+}
+
+// =====================
+// LED UPDATE
+// =====================
+void updateLEDs() {
+  for (int i = 0; i < NUM_LEDS; i++) ledBuffer[i] = {0, 0, 0};
+
+  // Team LEDs
+  for (int s = 0; s < MAX_TEAMS; s++) {
+    int led = ledForSlot[s];
+    if (teamColor[led] >= 0)
+      ledBuffer[led] = palette[teamColor[led]];
+  }
+
+  // Rainbow on LEDs 2 and 13 in manager mode
+  if (managerMode) {
+    Color rc = hueToColor(rainbowHue);
+    ledBuffer[2]  = rc;
+    ledBuffer[13] = rc;
+  }
+
+  // Timer LEDs 3-12
+  if (gameActive && timerSeconds > 10) {
+    for (int led = 0; led < 10; led++)
+      ledBuffer[3 + led] = getTimerLedColor(led);
+  } else if (gameActive && timerSeconds <= 10) {
+    // handled by updateFinalCountdown
+  } else {
+    for (int i = 3; i <= 12; i++) ledBuffer[i] = {0, 0, 0};
+  }
+
+  // Cursor in manager mode
+  if (managerMode) {
+    int cLed = cursorLed();
+    if (!cursorVisible) {
+      ledBuffer[cLed] = {0, 0, 0};
+    } else if (teamColor[cLed] < 0) {
+      ledBuffer[cLed] = {255, 255, 255};
+    }
+  }
+
+  showLEDs();
+}
+
+void updateFinalCountdown() {
+  int ledsOff = 10 - timerSeconds;
+  for (int led = 0; led < 10; led++)
+    ledBuffer[3 + led] = (led < ledsOff) ? Color{0,0,0} : Color{255,0,0};
+  for (int s = 0; s < MAX_TEAMS; s++) {
+    int led = ledForSlot[s];
+    if (teamColor[led] >= 0) ledBuffer[led] = palette[teamColor[led]];
+  }
+  if (managerMode) {
+    Color rc = hueToColor(rainbowHue);
+    ledBuffer[2] = rc; ledBuffer[13] = rc;
+    int cLed = cursorLed();
+    if (!cursorVisible) ledBuffer[cLed] = {0,0,0};
+    else if (teamColor[cLed] < 0) ledBuffer[cLed] = {255,255,255};
+  }
+  showLEDs();
+}
+
+// =====================
+// BUTTON
+// =====================
+bool btnPressed(int pin) {
+  if (digitalRead(pin) == LOW) {
+    delay(50);
+    if (digitalRead(pin) == LOW) {
+      while (digitalRead(pin) == LOW);
+      return true;
+    }
+  }
+  return false;
+}
+
+// =====================
+// SETUP
+// =====================
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_START,   INPUT_PULLUP);
+  pinMode(BTN_P1,      INPUT_PULLUP);
+  pinMode(BTN_P2,      INPUT_PULLUP);
+  pinMode(BTN_MANAGER, INPUT_PULLUP);
+  pinMode(BTN_ACTION,  INPUT_PULLUP);
+  pinMode(BUZZER_PIN,  OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  rmt_init();
+  delay(200);
+  clearAll();
+  delay(100);
+
+  for (int i = 0; i < NUM_LEDS; i++) teamColor[i] = -1;
+  for (int i = 0; i < MAX_TEAMS; i++) tieUsed[i] = false;
+
+  // Default 6 teams
+  teamColor[0]  = 0; colorUsed[0] = true;  // Blue
+  teamColor[1]  = 1; colorUsed[1] = true;  // Red
+  teamColor[14] = 2; colorUsed[2] = true;  // Green
+  teamColor[15] = 3; colorUsed[3] = true;  // Orange
+  teamColor[16] = 4; colorUsed[4] = true;  // Purple
+  teamColor[17] = 5; colorUsed[5] = true;  // Cyan
+
+  queue[0]=0; queue[1]=1; queue[2]=14;
+  queue[3]=15; queue[4]=16; queue[5]=17;
+  queueSize = 6;
+
+  cursorIndex = reachableCount() - 1;
+
+  timerSeconds = 300;
+  gameActive   = false;
+  updateLEDs();
+  Serial.println("Ready");
+}
+
+// =====================
+// LOOP
+// =====================
+void loop() {
+  unsigned long now = millis();
+
+  // Rainbow and cursor blink always run in manager mode
+  if (managerMode) {
+    if (now - lastRainbow >= 20) {
+      lastRainbow = now;
+      rainbowHue  = (rainbowHue + 2) % 256;
+    }
+    if (now - lastCursorBlink >= 400) {
+      lastCursorBlink = now;
+      cursorVisible   = !cursorVisible;
+    }
+  }
+
+  // Timer runs always — visual only, does not affect queue
+  if (timerRunning) {
+    if (timerSeconds > 10) {
+      if (now - lastTick >= 1000) {
+        lastTick = now;
+        timerSeconds--;
+        updateLEDs();
+        Serial.println(timerSeconds);
+      }
+    } else {
+      if (now - lastTick >= 1000) {
+        lastTick = now;
+        timerSeconds--;
+        Serial.println(timerSeconds);
+        if (timerSeconds <= 0) {
+          // Timer done — visual only, just buzzer and reset display
+          timerRunning = false;
+          gameActive   = false;
+          finalWhiteBlink();
+          for (int i = 3; i <= 12; i++) ledBuffer[i] = {0,0,0};
+          showLEDs();
+          buzzTimerEnd();
+          timerSeconds = 300;
+          updateLEDs();
+          Serial.println("Timer done — record result manually");
+        } else {
+          updateFinalCountdown();
+        }
+      }
+    }
+  }
+
+  // Manager toggle — always active
+  if (btnPressed(BTN_MANAGER)) {
+    managerMode = !managerMode;
+    if (managerMode) {
+      cursorIndex     = reachableCount() - 1;
+      cursorVisible   = true;
+      lastCursorBlink = now;
+      Serial.println("Manager ON");
+    } else {
+      Serial.println("Manager OFF");
+    }
+    buzzClick();
+    updateLEDs();
+    return;
+  }
+
+  if (managerMode) {
+
+    // P1 = cursor left
+    if (btnPressed(BTN_P1)) {
+      int reach = reachableCount();
+      cursorIndex     = (cursorIndex - 1 + reach) % reach;
+      cursorVisible   = true;
+      lastCursorBlink = now;
+      buzzClick();
+      updateLEDs();
+    }
+
+    // P2 = cursor right
+    if (btnPressed(BTN_P2)) {
+      int reach = reachableCount();
+      cursorIndex     = (cursorIndex + 1) % reach;
+      cursorVisible   = true;
+      lastCursorBlink = now;
+      buzzClick();
+      updateLEDs();
+    }
+
+    // START = cycle color
+    if (btnPressed(BTN_START)) {
+      int cLed = cursorLed();
+      if (teamColor[cLed] >= 0) {
+        int current = teamColor[cLed];
+        int next = -1;
+        for (int i = 1; i <= NUM_COLORS; i++) {
+          int candidate = (current + i) % NUM_COLORS;
+          if (!colorUsed[candidate] || candidate == current) {
+            next = candidate;
+            break;
+          }
+        }
+        if (next >= 0 && next != current) {
+          colorUsed[current] = false;
+          colorUsed[next]    = true;
+          teamColor[cLed]    = next;
+          buzzClick();
+          updateLEDs();
+        }
+      }
+    }
+
+    // ACTION = add or remove
+    if (btnPressed(BTN_ACTION)) {
+      int cLed = cursorLed();
+      if (teamColor[cLed] >= 0) {
+        removeTeamAt(cLed);
+        int reach = reachableCount();
+        if (cursorIndex >= reach) cursorIndex = reach - 1;
+        buzzRemove();
+      } else {
+        int col = firstAvailableColor();
+        if (col >= 0) {
+          addTeamAt(cLed, col);
+          buzzAdd();
+        }
+      }
+      updateLEDs();
+    }
+
+  } else {
+    // Game mode
+
+    // START — begin game
+    if (btnPressed(BTN_START)) {
+      if (!gameActive && queueSize >= 2) {
+        startWave();
+        buzzStart();
+        gameActive   = true;
+        timerRunning = true;
+        timerSeconds = 300;
+        lastTick     = now;
+        // Reset tie tracking for P1 and P2 on game start
+        tieUsed[0] = false;
+        tieUsed[1] = false;
+        updateLEDs();
+        Serial.println("Game started");
+      }
+    }
+
+    // P1 wins
+    if (btnPressed(BTN_P1)) {
+      buzzWin();
+      p1Wins();
+      gameActive   = false;
+      timerRunning = false;
+      timerSeconds = 300;
+      updateLEDs();
+    }
+
+    // P2 wins
+    if (btnPressed(BTN_P2)) {
+      buzzWin();
+      p2Wins();
+      gameActive   = false;
+      timerRunning = false;
+      timerSeconds = 300;
+      updateLEDs();
+    }
+
+    // ACTION = tie
+    if (btnPressed(BTN_ACTION)) {
+      buzzTie();
+      doTie();
+      gameActive   = false;
+      timerRunning = false;
+      timerSeconds = 300;
+      updateLEDs();
+    }
+  }
+
+  // Continuous refresh for cursor blink and rainbow
+  if (managerMode) updateLEDs();
+}
