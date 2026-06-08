@@ -1,0 +1,917 @@
+// ─── Remote Side v4 ──────────────────────────────────────────────────────────
+// Super Mini ESP32-S3 (HW-747)
+//
+// Pin assignments:
+//   BTN UP            → GPIO 1 → GND
+//   BTN DOWN          → GPIO 2 → GND
+//   BTN ENTER         → GPIO 3 → GND
+//   OLED SCL          → GPIO 5
+//   OLED SDA          → GPIO 6
+//   Buzzer            → GPIO 4
+//   NRF24L01 CE       → GPIO 8
+//   NRF24L01 CSN      → GPIO 9
+//   NRF MOSFET gate   → GPIO 10
+//   NRF24L01 MOSI     → GPIO 11
+//   NRF24L01 MISO     → GPIO 12
+//   NRF24L01 SCK      → GPIO 13
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SPI.h>
+#include <RF24.h>
+#include <Preferences.h>
+
+// ── OLED ─────────────────────────────────────────────────────────────────────
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ── Buttons ───────────────────────────────────────────────────────────────────
+#define BTN_UP    1
+#define BTN_DOWN  2
+#define BTN_ENTER 3
+#define BUZZER_PIN 4
+
+bool lastUpState    = false;
+bool lastDownState  = false;
+bool lastEnterState = false;
+unsigned long lastUpTime   = 0;
+unsigned long lastDownTime = 0;
+#define DEBOUNCE_MS 200
+
+unsigned long enterHoldStart = 0;
+bool enterHolding   = false;
+bool longPressFired = false;
+#define LONG_PRESS_MS 800
+
+// Input lockout after screen transitions
+unsigned long lockoutUntil = 0;
+#define LOCKOUT_MS 500
+bool inputLocked() { return millis() < lockoutUntil; }
+void triggerLockout() { lockoutUntil = millis() + LOCKOUT_MS; }
+
+// ── Buzzer ────────────────────────────────────────────────────────────────────
+void playTone(int freq, int duration) {
+  int period = 1000000 / freq;
+  long endTime = millis() + duration;
+  while (millis() < endTime) {
+    digitalWrite(BUZZER_PIN, HIGH); delayMicroseconds(period / 2);
+    digitalWrite(BUZZER_PIN, LOW);  delayMicroseconds(period / 2);
+  }
+}
+void buzzConfirm()   { playTone(1200, 80); delay(40); playTone(1600, 120); }
+void buzzStart()     { playTone(1046,100); delay(50); playTone(1318,100); delay(50); playTone(1568,200); }
+void buzzTimerEnd()  { for(int i=0;i<3;i++){ playTone(880,200); delay(100); } }
+void buzzResult()    { playTone(1568,150); delay(50); playTone(1046,200); }
+void buzzError()     { playTone(300, 200); }
+
+// ── NRF24L01 ─────────────────────────────────────────────────────────────────
+#define NRF_CE      8
+#define NRF_CSN     9
+#define NRF_MOSFET 10
+RF24 radio(NRF_CE, NRF_CSN);
+const byte PIPE_A[6] = "REM01";
+const byte PIPE_B[6] = "DSP01";
+bool nrfEnabled = false;
+
+// ── Game state mirrored from display ─────────────────────────────────────────
+#define MAX_SLOTS  9
+#define NUM_COLORS 9
+#define COLOR_NONE -1
+
+int  remoteSlotColor[MAX_SLOTS];
+bool managerDirty = false;
+
+const char* colorNames[NUM_COLORS]   = {"Blue","Red","Green","Orange","Purple","Cyan","Yellow","Magenta","White"};
+const char  colorLetters[NUM_COLORS] = {'B','R','G','O','P','C','Y','M','W'};
+bool colorUsed[NUM_COLORS] = {false};
+
+int  pendingColors[MAX_SLOTS];
+
+// ── Internal timer ────────────────────────────────────────────────────────────
+// Timer runs fully independently on remote — not synced from display
+int timerPresets[]        = {60, 180, 300, 600, 900, 1200};
+const char* timerLabels[] = {"1 min","3 min","5 min","10 min","15 min","20 min"};
+#define NUM_PRESETS 6
+
+int  timerPresetIdx     = 2;   // Active preset for next game
+int  nextTimerPresetIdx = 2;   // Pending preset — applies on next start
+int  internalTimer      = 300; // Current countdown seconds
+bool timerRunning       = false;
+bool gameActive         = false;
+unsigned long lastTick  = 0;
+
+// Game result status — visual only, does not block input
+enum ResultStatus {
+  RESULT_NONE,       // No game yet or game in progress
+  RESULT_AWAITING,   // Timer ended, waiting for P1/P2/Tie
+  RESULT_RECEIVED    // Result confirmed from display
+};
+ResultStatus resultStatus   = RESULT_NONE;
+String       resultLabel    = "";           // "P1" "P2" "TIE"
+unsigned long resultShowUntil = 0;
+#define RESULT_SHOW_MS 3000  // Show result received message for 3 seconds
+
+// ── Preferences ───────────────────────────────────────────────────────────────
+Preferences prefs;
+
+// ── Screen state ──────────────────────────────────────────────────────────────
+enum Screen {
+  SCR_MAIN,
+  SCR_CONFIRM,
+  SCR_MANAGER,
+  SCR_MANAGER_COLOR,
+  SCR_MANAGER_FETCH,
+  SCR_CONTROLS,
+  SCR_CONTROLS_TIMER
+};
+Screen currentScreen = SCR_MAIN;
+
+int exitsToHome() {
+  switch (currentScreen) {
+    case SCR_MAIN:           return 0;
+    case SCR_CONFIRM:        return 0;
+    case SCR_MANAGER:        return 1;
+    case SCR_CONTROLS:       return 1;
+    case SCR_MANAGER_COLOR:  return 2;
+    case SCR_CONTROLS_TIMER: return 2;
+    case SCR_MANAGER_FETCH:  return 1;
+    default:                 return 0;
+  }
+}
+
+const char* mainMenuItems[] = {"P1 Wins","P2 Wins","Tie","Start Game","Manager","Controls"};
+#define MAIN_MENU_COUNT 6
+int mainMenuIdx = 0;
+
+String confirmMsg    = "";
+String confirmDetail = "";
+
+int  managerCursor   = 0;
+int  managerEditSlot = -1;
+int  managerColorIdx = 0;
+
+#define MGR_EXIT_IDX  MAX_SLOTS
+#define MGR_TOTAL     (MAX_SLOTS + 1)
+
+#define COLOR_REMOVE_IDX NUM_COLORS
+#define COLOR_EXIT_IDX   (NUM_COLORS + 1)
+#define COLOR_TOTAL      (NUM_COLORS + 2)
+
+const char* controlsItems[] = {"Timer duration","Lock display","Unlock display"};
+#define CONTROLS_COUNT   3
+#define CTRL_EXIT_IDX    CONTROLS_COUNT
+#define CTRL_TOTAL       (CONTROLS_COUNT + 1)
+int controlsIdx = 0;
+
+#define TIMER_EXIT_IDX   NUM_PRESETS
+#define TIMER_TOTAL      (NUM_PRESETS + 1)
+int controlsTimerIdx = 0;
+
+bool displayLocked = false;
+
+// ── NRF helpers ───────────────────────────────────────────────────────────────
+bool sendCommand(const char* cmd) {
+  if (!nrfEnabled) return false;
+  radio.stopListening();
+  delay(5);
+  bool ok = radio.write(cmd, strlen(cmd) + 1);
+  radio.startListening();
+  return ok;
+}
+
+String waitForResponse(int timeoutMs = 2000) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (radio.available()) {
+      char buf[64] = {0};
+      radio.read(buf, sizeof(buf));
+      return String(buf);
+    }
+  }
+  return "TIMEOUT";
+}
+
+void parseStateString(String s) {
+  // Only use state string for slot colors — timer and game state managed internally
+  if (!s.startsWith("STATE:")) return;
+  s = s.substring(6);
+  int colonIdx = s.indexOf(':');
+  String slotPart = s.substring(0, colonIdx);
+  for (int i = 0; i < MAX_SLOTS; i++) {
+    int ci  = slotPart.indexOf(',');
+    String val = (ci >= 0) ? slotPart.substring(0, ci) : slotPart;
+    remoteSlotColor[i] = val.toInt();
+    if (ci >= 0) slotPart = slotPart.substring(ci + 1);
+  }
+  for (int c = 0; c < NUM_COLORS; c++) colorUsed[c] = false;
+  for (int s2 = 0; s2 < MAX_SLOTS; s2++)
+    if (remoteSlotColor[s2] != COLOR_NONE && remoteSlotColor[s2] < NUM_COLORS)
+      colorUsed[remoteSlotColor[s2]] = true;
+}
+
+// ── Timer control ─────────────────────────────────────────────────────────────
+void startInternalTimer() {
+  timerPresetIdx = nextTimerPresetIdx;
+  internalTimer  = timerPresets[timerPresetIdx] + 1.7;
+  timerRunning   = true;
+  gameActive     = true;
+  resultStatus   = RESULT_NONE;
+  resultLabel    = "";
+  lastTick       = millis();
+}
+
+void stopInternalTimer() {
+  timerRunning = false;
+  gameActive   = false;
+}
+
+void timerExpired() {
+  timerRunning  = false;
+  gameActive    = false;
+  resultStatus  = RESULT_AWAITING;
+  buzzTimerEnd();
+}
+
+void resultReceived(String label) {
+  resultStatus    = RESULT_RECEIVED;
+  resultLabel     = label;
+  resultShowUntil = millis() + RESULT_SHOW_MS;
+  stopInternalTimer();
+}
+
+// ── OLED helpers ──────────────────────────────────────────────────────────────
+void drawTeamDot(int x, int y, int colorIdx) {
+  display.drawCircle(x, y, 5, WHITE);
+  if (colorIdx != COLOR_NONE && colorIdx < NUM_COLORS) {
+    display.setCursor(x - 3, y - 3);
+    display.print(colorLetters[colorIdx]);
+  }
+}
+
+void drawScrollBar(int total, int current, int visible) {
+  if (total <= visible) return;
+  int thumbH = max(4, 64 * visible / total);
+  int thumbY = (64 - thumbH) * current / max(1, total - 1);
+  display.drawRect(126, 0, 2, 64, WHITE);
+  display.fillRect(126, thumbY, 2, thumbH, WHITE);
+}
+/*
+void drawTildeBorder() {
+  for (int y = 0; y < 64; y += 8) {
+    display.setCursor(0, y);   display.print("~");
+    display.setCursor(120, y); display.print("~");
+  }
+}
+*/
+void drawExitCounter() {
+  int exits = exitsToHome();
+  display.setTextColor(WHITE);
+  if (exits == 0) {
+    display.setCursor(86, 0); display.print("[home]");
+  } else {
+    char buf[12];
+    snprintf(buf, sizeof(buf), "[%d home]", exits);
+    int xpos = 128 - (strlen(buf) * 6);
+    display.setCursor(xpos, 0); display.print(buf);
+  }
+}
+
+// Draw game status bar — shows timer, awaiting result, or result received
+// Displayed on main menu only, does not block navigation
+void drawStatusBar() {
+  if (resultStatus == RESULT_RECEIVED) {
+    display.setCursor(0, 0);
+    display.print("RESULT: "); display.print(resultLabel);
+    return;
+  }
+  if (resultStatus == RESULT_AWAITING) {
+    display.setCursor(0, 0);
+    display.print("AWAITING RESULT");
+    return;
+  }
+  if (gameActive || timerRunning) {
+    int m = internalTimer / 60, sec = internalTimer % 60;
+    char buf[8]; snprintf(buf, sizeof(buf), "%d:%02d", m, sec);
+    display.setCursor(0, 0); display.print(buf);
+  }
+}
+
+// ── Screen renderers ──────────────────────────────────────────────────────────
+void drawMainMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  int s0c = COLOR_NONE, s1c = COLOR_NONE, cnt = 0;
+  for (int s = 0; s < MAX_SLOTS && cnt < 2; s++) {
+    if (remoteSlotColor[s] != COLOR_NONE) {
+      if (cnt == 0) s0c = remoteSlotColor[s];
+      else           s1c = remoteSlotColor[s];
+      cnt++;
+    }
+  }
+
+  drawStatusBar();
+  drawExitCounter();
+
+  if (s0c != COLOR_NONE) drawTeamDot(108, 24, s0c);
+  if (s1c != COLOR_NONE) drawTeamDot(122, 24, s1c);
+
+  if (displayLocked) { display.setCursor(0, 56); display.print("[LOCKED]"); }
+
+  int startIdx = max(0, min(mainMenuIdx - 1, MAIN_MENU_COUNT - 3));
+  for (int i = 0; i < 3; i++) {
+    int idx = startIdx + i;
+    if (idx >= MAIN_MENU_COUNT) break;
+    int y = 16 + i * 14;
+    if (idx == mainMenuIdx) {
+      display.fillRect(0, y-1, 105, 12, WHITE);
+      display.setTextColor(BLACK);
+    } else {
+      display.setTextColor(WHITE);
+    }
+    display.setCursor(4, y);
+    display.print(mainMenuItems[idx]);
+    if (idx == 0 && s0c != COLOR_NONE) { display.setCursor(82, y); display.print(colorLetters[s0c]); }
+    if (idx == 1 && s1c != COLOR_NONE) { display.setCursor(82, y); display.print(colorLetters[s1c]); }
+    display.setTextColor(WHITE);
+  }
+
+  display.setCursor(0, 56); display.print("Q:");
+  int qcount = 0;
+  for (int s = 2; s < MAX_SLOTS; s++) {
+    if (remoteSlotColor[s] != COLOR_NONE) {
+      display.print(colorLetters[remoteSlotColor[s]]); qcount++;
+    }
+  }
+  if (qcount == 0) display.print("empty");
+
+  drawScrollBar(MAIN_MENU_COUNT, mainMenuIdx, 3);
+  display.display();
+}
+
+void drawConfirmScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0); display.print("-- CONFIRMED --");
+  drawExitCounter();
+  display.setTextSize(2);
+  display.setCursor(10, 20); display.print(confirmMsg);
+  display.setTextSize(1);
+  if (confirmDetail.length() > 0) { display.setCursor(0, 44); display.print(confirmDetail); }
+  display.setCursor(0, 56); display.print("press any button");
+  display.display();
+}
+
+void drawFetchScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  //drawTildeBorder();
+  display.setCursor(10, 20); display.print("FETCHING QUEUE");
+  display.setCursor(20, 36); display.print("DATA...");
+  display.display();
+}
+
+void drawManagerMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  //drawTildeBorder();
+  display.setCursor(18, 0); display.print("MANAGER");
+  drawExitCounter();
+
+  int visStart = max(0, min(managerCursor - 1, MGR_TOTAL - 3));
+  for (int i = 0; i < 3; i++) {
+    int slot    = visStart + i;
+    if (slot >= MGR_TOTAL) break;
+    bool isExit = (slot == MGR_EXIT_IDX);
+    int y       = 14 + i * 14;
+    if (slot == managerCursor) {
+      display.fillRect(8, y-1, 108, 12, WHITE);
+      display.setTextColor(BLACK);
+    }
+    display.setCursor(10, y);
+    if (isExit) {
+      display.print("[ EXIT ]");
+    } else {
+      if (slot < 2) display.print(slot == 0 ? "P1:" : "P2:");
+      else { display.print("Q"); display.print(slot-1); display.print(":"); }
+      if (pendingColors[slot] == COLOR_NONE) display.print(" [--BLANK--]");
+      else { display.print(" "); display.print(colorNames[pendingColors[slot]]); }
+    }
+    display.setTextColor(WHITE);
+  }
+
+  display.setCursor(8, 56); display.print("[OK]=edit [--]=save");
+  drawScrollBar(MGR_TOTAL, managerCursor, 3);
+  display.display();
+}
+
+void drawManagerColorPicker() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  //drawTildeBorder();
+  display.setCursor(12, 0); display.print("COLOR");
+  drawExitCounter();
+
+  display.setCursor(10, 10);
+  if (managerEditSlot < 2) display.print(managerEditSlot == 0 ? "P1" : "P2");
+  else { display.print("Q"); display.print(managerEditSlot-1); }
+
+  int startOpt = max(0, min(managerColorIdx - 1, COLOR_TOTAL - 3));
+  for (int i = 0; i < 3; i++) {
+    int opt = startOpt + i;
+    if (opt >= COLOR_TOTAL) break;
+    int y = 22 + i * 13;
+    if (opt == managerColorIdx) {
+      display.fillRect(8, y-1, 108, 12, WHITE);
+      display.setTextColor(BLACK);
+    }
+    display.setCursor(10, y);
+    if      (opt == COLOR_EXIT_IDX)   display.print("[ EXIT ]");
+    else if (opt == COLOR_REMOVE_IDX) display.print("[ REMOVE ]");
+    else {
+      display.print(colorLetters[opt]); display.print(" ");
+      display.print(colorNames[opt]);
+      if (colorUsed[opt] && opt != pendingColors[managerEditSlot]) display.print(" *");
+    }
+    display.setTextColor(WHITE);
+  }
+
+  display.setCursor(8, 56); display.print("[OK] [--]=back");
+  drawScrollBar(COLOR_TOTAL, managerColorIdx, 3);
+  display.display();
+}
+
+void drawControlsMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0); display.print("CONTROLS");
+  drawExitCounter();
+
+  for (int i = 0; i < CTRL_TOTAL; i++) {
+    int y       = 14 + i * 12;
+    bool isExit = (i == CTRL_EXIT_IDX);
+    if (i == controlsIdx) {
+      display.fillRect(0, y-1, 120, 12, WHITE);
+      display.setTextColor(BLACK);
+    }
+    display.setCursor(4, y);
+    if (isExit) display.print("[ EXIT ]");
+    else        display.print(controlsItems[i]);
+    display.setTextColor(WHITE);
+  }
+  // Show pending timer so user knows what next game will use
+  display.setCursor(0, 56);
+  display.print("Next: "); display.print(timerLabels[nextTimerPresetIdx]);
+  display.display();
+}
+
+void drawControlsTimer() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0); display.print("TIMER");
+  drawExitCounter();
+
+  int startOpt = max(0, min(controlsTimerIdx - 1, TIMER_TOTAL - 3));
+  for (int i = 0; i < 3; i++) {
+    int opt     = startOpt + i;
+    if (opt >= TIMER_TOTAL) break;
+    bool isExit = (opt == TIMER_EXIT_IDX);
+    int y       = 14 + i * 14;
+    if (opt == controlsTimerIdx) {
+      display.fillRect(0, y-1, 120, 12, WHITE);
+      display.setTextColor(BLACK);
+    }
+    display.setCursor(4, y);
+    if (isExit) display.print("[ EXIT ]");
+    else {
+      display.print(timerLabels[opt]);
+      // Mark current active and pending
+      if (opt == timerPresetIdx)     { display.print(" <cur"); }
+      if (opt == nextTimerPresetIdx && opt != timerPresetIdx) { display.print(" <next"); }
+    }
+    display.setTextColor(WHITE);
+  }
+
+  display.setCursor(0, 56); display.print("[OK] select for next game");
+  drawScrollBar(TIMER_TOTAL, controlsTimerIdx, 3);
+  display.display();
+}
+
+void refreshDisplay() {
+  switch (currentScreen) {
+    case SCR_MAIN:           drawMainMenu();           break;
+    case SCR_CONFIRM:        drawConfirmScreen();      break;
+    case SCR_MANAGER:        drawManagerMenu();        break;
+    case SCR_MANAGER_COLOR:  drawManagerColorPicker(); break;
+    case SCR_MANAGER_FETCH:  drawFetchScreen();        break;
+    case SCR_CONTROLS:       drawControlsMenu();       break;
+    case SCR_CONTROLS_TIMER: drawControlsTimer();      break;
+  }
+}
+
+void showConfirm(String msg, String detail = "") {
+  confirmMsg    = msg;
+  confirmDetail = detail;
+  currentScreen = SCR_CONFIRM;
+  triggerLockout();
+  refreshDisplay();
+}
+
+// ── Fetch state from display ──────────────────────────────────────────────────
+bool fetchDisplayState() {
+  currentScreen = SCR_MANAGER_FETCH;
+  refreshDisplay();
+  bool sent = sendCommand("GET_STATE");
+  if (!sent) return false;
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    if (radio.available()) {
+      char buf[64] = {0};
+      radio.read(buf, sizeof(buf));
+      String resp = String(buf);
+      if (resp.startsWith("STATE:")) {
+        parseStateString(resp);
+        for (int s = 0; s < MAX_SLOTS; s++) pendingColors[s] = remoteSlotColor[s];
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void sendManagerSave() {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "SLOTS:%d,%d,%d,%d,%d,%d,%d,%d,%d",
+    pendingColors[0], pendingColors[1], pendingColors[2],
+    pendingColors[3], pendingColors[4], pendingColors[5],
+    pendingColors[6], pendingColors[7], pendingColors[8]);
+  sendCommand(buf);
+  String resp = waitForResponse();
+  if (resp.startsWith("OK:SLOTS")) {
+    for (int s = 0; s < MAX_SLOTS; s++) remoteSlotColor[s] = pendingColors[s];
+    for (int c = 0; c < NUM_COLORS; c++) colorUsed[c] = false;
+    for (int s = 0; s < MAX_SLOTS; s++)
+      if (remoteSlotColor[s] != COLOR_NONE && remoteSlotColor[s] < NUM_COLORS)
+        colorUsed[remoteSlotColor[s]] = true;
+    showConfirm("SAVED", "Queue updated");
+  } else {
+    showConfirm("ERROR", "Save failed");
+  }
+}
+
+// ── Button handlers ───────────────────────────────────────────────────────────
+void handleUp() {
+  if (inputLocked()) return;
+  if (currentScreen == SCR_CONFIRM) {
+    currentScreen = SCR_MAIN; refreshDisplay(); return;
+  }
+  switch (currentScreen) {
+    case SCR_MAIN:           mainMenuIdx      = (mainMenuIdx - 1 + MAIN_MENU_COUNT) % MAIN_MENU_COUNT; break;
+    case SCR_MANAGER:        managerCursor    = (managerCursor - 1 + MGR_TOTAL) % MGR_TOTAL; break;
+    case SCR_MANAGER_COLOR:  managerColorIdx  = (managerColorIdx - 1 + COLOR_TOTAL) % COLOR_TOTAL; break;
+    case SCR_CONTROLS:       controlsIdx      = (controlsIdx - 1 + CTRL_TOTAL) % CTRL_TOTAL; break;
+    case SCR_CONTROLS_TIMER: controlsTimerIdx = (controlsTimerIdx - 1 + TIMER_TOTAL) % TIMER_TOTAL; break;
+  }
+  refreshDisplay();
+}
+
+void handleDown() {
+  if (inputLocked()) return;
+  if (currentScreen == SCR_CONFIRM) {
+    currentScreen = SCR_MAIN; refreshDisplay(); return;
+  }
+  switch (currentScreen) {
+    case SCR_MAIN:           mainMenuIdx      = (mainMenuIdx + 1) % MAIN_MENU_COUNT; break;
+    case SCR_MANAGER:        managerCursor    = (managerCursor + 1) % MGR_TOTAL; break;
+    case SCR_MANAGER_COLOR:  managerColorIdx  = (managerColorIdx + 1) % COLOR_TOTAL; break;
+    case SCR_CONTROLS:       controlsIdx      = (controlsIdx + 1) % CTRL_TOTAL; break;
+    case SCR_CONTROLS_TIMER: controlsTimerIdx = (controlsTimerIdx + 1) % TIMER_TOTAL; break;
+  }
+  refreshDisplay();
+}
+
+void handleEnter() {
+  if (inputLocked()) return;
+  if (currentScreen == SCR_CONFIRM) {
+    currentScreen = SCR_MAIN; refreshDisplay(); return;
+  }
+
+  switch (currentScreen) {
+
+    case SCR_MAIN: {
+      if (mainMenuIdx == 4) {
+        bool ok = fetchDisplayState();
+        if (ok) {
+          managerCursor = 0; managerDirty = false;
+          currentScreen = SCR_MANAGER; triggerLockout();
+        } else {
+          showConfirm("NO LINK", "Display unreachable");
+        }
+        refreshDisplay();
+
+      } else if (mainMenuIdx == 5) {
+        controlsIdx   = 0;
+        currentScreen = SCR_CONTROLS; triggerLockout();
+        refreshDisplay();
+
+      } else {
+        const char* cmds[] = {"P1","P2","TIE","START"};
+        bool sent = sendCommand(cmds[mainMenuIdx]);
+        if (sent) {
+          String resp = waitForResponse();
+          if (resp.startsWith("OK:")) {
+            String label = resp.substring(3);
+
+            // Handle game state changes based on confirmed command
+            if (mainMenuIdx == 3) {
+              // START confirmed — begin internal timer
+              startInternalTimer();
+              buzzStart();
+              mainMenuIdx = 1;  // Auto-select P2
+              showConfirm("STARTED", timerLabels[timerPresetIdx]);
+            } else {
+              // P1 / P2 / TIE confirmed — stop timer, mark result received
+              resultReceived(label);
+              stopInternalTimer();
+              buzzResult();
+              mainMenuIdx = 3;  // Auto-select Start Game
+              showConfirm(label, "Result confirmed");
+            }
+          } else if (resp == "TIMEOUT") {
+            buzzError();
+            showConfirm("TIMEOUT", "No response");
+          } else {
+            buzzError();
+            showConfirm("ERROR", resp);
+          }
+        } else {
+          buzzError();
+          showConfirm("NO LINK", "Send failed");
+        }
+      }
+      break;
+    }
+
+    case SCR_MANAGER:
+      if (managerCursor == MGR_EXIT_IDX) {
+        currentScreen = SCR_MAIN; triggerLockout();
+      } else {
+        managerEditSlot = managerCursor;
+        managerColorIdx = (pendingColors[managerCursor] == COLOR_NONE) ? 0 : pendingColors[managerCursor];
+        currentScreen   = SCR_MANAGER_COLOR; triggerLockout();
+      }
+      refreshDisplay(); break;
+
+    case SCR_MANAGER_COLOR:
+      if (managerColorIdx == COLOR_EXIT_IDX) {
+        currentScreen = SCR_MANAGER; triggerLockout();
+      } else {
+        int slot = managerEditSlot;
+        if (managerColorIdx == COLOR_REMOVE_IDX) {
+          if (pendingColors[slot] != COLOR_NONE) {
+            colorUsed[pendingColors[slot]] = false;
+            pendingColors[slot] = COLOR_NONE;
+            managerDirty = true;
+          }
+        } else {
+          int newColor = managerColorIdx;
+          int oldColor = pendingColors[slot];
+          if (newColor != oldColor) {
+            if (colorUsed[newColor]) {
+              for (int s = 0; s < MAX_SLOTS; s++) {
+                if (pendingColors[s] == newColor && s != slot) {
+                  pendingColors[s] = (oldColor == COLOR_NONE) ? COLOR_NONE : oldColor;
+                  if (oldColor != COLOR_NONE) colorUsed[oldColor] = true;
+                  break;
+                }
+              }
+            } else {
+              if (oldColor != COLOR_NONE) colorUsed[oldColor] = false;
+            }
+            pendingColors[slot] = newColor;
+            colorUsed[newColor] = true;
+            managerDirty = true;
+          }
+        }
+        currentScreen = SCR_MANAGER; triggerLockout();
+      }
+      refreshDisplay(); break;
+
+    case SCR_CONTROLS:
+      if (controlsIdx == CTRL_EXIT_IDX) {
+        currentScreen = SCR_MAIN; triggerLockout();
+      } else if (controlsIdx == 0) {
+        controlsTimerIdx = nextTimerPresetIdx;
+        currentScreen    = SCR_CONTROLS_TIMER; triggerLockout();
+      } else if (controlsIdx == 1) {
+        bool sent = sendCommand("LOCK_DISPLAY");
+        if (sent) {
+          waitForResponse(); displayLocked = true;
+          buzzConfirm(); showConfirm("LOCKED", "Display locked");
+        } else { buzzError(); showConfirm("NO LINK", "Send failed"); }
+      } else if (controlsIdx == 2) {
+        bool sent = sendCommand("UNLOCK_DISPLAY");
+        if (sent) {
+          waitForResponse(); displayLocked = false;
+          buzzConfirm(); showConfirm("UNLOCKED", "Display unlocked");
+        } else { buzzError(); showConfirm("NO LINK", "Send failed"); }
+      }
+      refreshDisplay(); break;
+
+    case SCR_CONTROLS_TIMER:
+      if (controlsTimerIdx == TIMER_EXIT_IDX) {
+        currentScreen = SCR_CONTROLS; triggerLockout();
+      } else {
+        // Set pending — applies on next start, not current game
+        nextTimerPresetIdx = controlsTimerIdx;
+        prefs.putInt("nextTimerIdx", nextTimerPresetIdx);
+
+        // Send to display so it also uses this duration next game
+        char buf[32];
+        snprintf(buf, sizeof(buf), "TIMER:%d", timerPresets[nextTimerPresetIdx]);
+        bool sent = sendCommand(buf);
+        if (sent) {
+          waitForResponse();
+          buzzConfirm();
+          showConfirm("TIMER SET", timerLabels[nextTimerPresetIdx]);
+        } else {
+          buzzConfirm();
+          showConfirm("TIMER SET", "Local only");
+        }
+      }
+      refreshDisplay(); break;
+
+    default: break;
+  }
+}
+
+void handleLongPress() {
+  if (inputLocked()) return;
+
+  switch (currentScreen) {
+    case SCR_CONFIRM:
+      currentScreen = SCR_MAIN; triggerLockout(); break;
+
+    case SCR_MANAGER_COLOR:
+      currentScreen = SCR_MANAGER; triggerLockout(); break;
+
+    case SCR_MANAGER:
+      if (managerDirty) sendManagerSave();
+      else { currentScreen = SCR_MAIN; triggerLockout(); }
+      break;
+
+    case SCR_CONTROLS_TIMER:
+    case SCR_CONTROLS:
+      currentScreen = SCR_MAIN; triggerLockout(); break;
+
+    default:
+      currentScreen = SCR_MAIN; triggerLockout(); break;
+  }
+  refreshDisplay();
+}
+
+// ── Handle incoming NRF state packets ────────────────────────────────────────
+void handleIncoming() {
+  if (!nrfEnabled || !radio.available()) return;
+  char buf[64] = {0};
+  radio.read(buf, sizeof(buf));
+  String msg = String(buf);
+  msg.trim();
+  // Only parse slot colors from state — do not use display timer
+  if (msg.startsWith("STATE:")) {
+    parseStateString(msg);
+    if (currentScreen == SCR_MAIN) refreshDisplay();
+  }
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+void setup() {
+  delay(2000);
+  Serial.begin(115200);
+  Wire.begin(6, 5);
+  
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED FAILED");
+    while (true);
+  }
+  display.setRotation(1);  // 90 degrees clockwise — right becomes top, left becomes bottom
+  Serial.println("OLED OK");
+
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0); display.print("Booting...");
+  display.display();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(BTN_UP,    INPUT_PULLUP);
+  pinMode(BTN_DOWN,  INPUT_PULLUP);
+  pinMode(BTN_ENTER, INPUT_PULLUP);
+
+  pinMode(NRF_MOSFET, OUTPUT);
+  digitalWrite(NRF_MOSFET, LOW);
+  delay(50);
+
+  SPI.begin(13, 12, 11, 9);
+  if (radio.begin()) {
+    radio.openWritingPipe(PIPE_A);
+    radio.openReadingPipe(1, PIPE_B);
+    radio.setPALevel(RF24_PA_HIGH);
+    radio.setDataRate(RF24_250KBPS);
+    radio.setChannel(100);
+    radio.startListening();
+    nrfEnabled = true;
+    Serial.println("NRF OK");
+  } else {
+    nrfEnabled = false;
+    Serial.println("NRF FAILED");
+  }
+
+  prefs.begin("remoteprefs", false);
+  nextTimerPresetIdx = prefs.getInt("nextTimerIdx", 2);
+  timerPresetIdx     = nextTimerPresetIdx;
+  internalTimer      = timerPresets[timerPresetIdx];
+
+  for (int s = 0; s < MAX_SLOTS; s++) {
+    remoteSlotColor[s] = COLOR_NONE;
+    pendingColors[s]   = COLOR_NONE;
+  }
+
+  currentScreen = SCR_MAIN;
+  refreshDisplay();
+  Serial.println("Ready");
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+unsigned long lastDisplayRefresh = 0;
+
+void loop() {
+  unsigned long now = millis();
+
+// Up button
+  bool upNow = (digitalRead(BTN_UP) == LOW);
+  if (upNow && !lastUpState && (now - lastUpTime > DEBOUNCE_MS)) {
+    lastUpTime = now;
+    handleUp();
+  }
+  lastUpState = upNow;
+
+  // Down button
+  bool downNow = (digitalRead(BTN_DOWN) == LOW);
+  if (downNow && !lastDownState && (now - lastDownTime > DEBOUNCE_MS)) {
+    lastDownTime = now;
+    handleDown();
+  }
+  lastDownState = downNow;
+
+  // Enter with long press
+  bool enterNow = (digitalRead(BTN_ENTER) == LOW);
+  if (enterNow && !lastEnterState) {
+    enterHoldStart = now; enterHolding = true; longPressFired = false;
+  }
+  if (enterHolding && !longPressFired && (now - enterHoldStart > LONG_PRESS_MS)) {
+    longPressFired = true; handleLongPress();
+  }
+  if (!enterNow && lastEnterState) {
+    if (!longPressFired) handleEnter();
+    enterHolding = false; longPressFired = false;
+  }
+  lastEnterState = enterNow;
+
+  // Internal timer tick
+  if (timerRunning && (now - lastTick >= 1000)) {
+    lastTick = now;
+    internalTimer--;
+    if (internalTimer <= 0) {
+      internalTimer = 0;
+      timerExpired();
+    }
+    if (currentScreen == SCR_MAIN) refreshDisplay();
+  }
+
+  // Clear result received message after timeout
+  if (resultStatus == RESULT_RECEIVED && now > resultShowUntil) {
+    resultStatus = RESULT_NONE;
+    if (currentScreen == SCR_MAIN) refreshDisplay();
+  }
+
+  // Incoming NRF packets
+  handleIncoming();
+
+  // Periodic OLED refresh during game for timer display
+  if (timerRunning && (now - lastDisplayRefresh >= 1000)) {
+    lastDisplayRefresh = now;
+    if (currentScreen == SCR_MAIN) refreshDisplay();
+  }
+}
